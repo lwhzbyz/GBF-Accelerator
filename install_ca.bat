@@ -1,17 +1,16 @@
 @echo off
-title Install GBF CA Certificate
 cd /d "%~dp0"
-echo ========================================================
-echo   GBF Speed Proxy - Install Root CA Certificate
-echo ========================================================
-echo.
-echo [*] Installing Root CA to CurrentUser Trusted Store...
-echo [*] Windows will show a Security Warning dialog.
-echo [*] Please click [ Yes ] to confirm installing the certificate!
-echo.
-certutil -addstore -user Root "%~dp0certs\ca.crt"
-echo.
-echo ========================================================
-echo   Installation finished! Press any key to exit.
-echo ========================================================
+echo This explicitly installs the current local CA in CurrentUser Root.
+echo For an old CA migration, read README.md before using --remove-legacy-ca.
+if exist ".venv\Scripts\python.exe" (
+  ".venv\Scripts\python.exe" app_main.py --install-ca %*
+) else (
+  py -3.12 app_main.py --install-ca %*
+)
+if errorlevel 1 (
+  echo CA installation did not complete. See the message above.
+  pause
+  exit /b 1
+)
+echo Current CA installation verified.
 pause

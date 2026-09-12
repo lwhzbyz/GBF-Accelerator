@@ -1,760 +1,550 @@
+"""Loopback GBF cache proxy; direct, HTTP(S) proxy and SOCKS5 uplinks."""
 import asyncio
+import base64
+from dataclasses import dataclass
+from http import HTTPStatus
+from http.cookiejar import CookieJar
+import ipaddress
 import ssl
-import time
 import sys
+import threading
 import urllib.parse
-from pathlib import Path
-from typing import Dict, Tuple, Optional
 
 import httpx
+from cache_manager import cache_manager, representation
 from cert_manager import get_server_ssl_context
-from cache_manager import cache_manager
-from config_manager import config_manager, kill_process_on_port
+from config_manager import config_manager, normalize_upstream
+from network_policy import cacheable_request, end_to_end_headers, normalize_host, should_mitm
 
-# Ensure safe UTF-8 output on Windows consoles
-if sys.platform == "win32":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-
-# ================= Configuration =================
 LISTEN_HOST = config_manager.config.get("listen_host", "127.0.0.1")
 LISTEN_PORT = config_manager.get_listen_port()
 UPSTREAM_PROXY = config_manager.get_effective_upstream_proxy()
-
-# Host patterns to perform SSL MITM inspection & caching (strictly scoped to GBF domains)
-MITM_SUFFIXES = (
-    "granbluefantasy.jp",
-    "granbluefantasy.com",
-    "granbluefantasy.akamaized.net",
-    "gbf.akamaized.net",
-    "mbga.jp",
-)
-
-# Raw passthrough domains (no SSL MITM, direct low-latency TCP stream)
-PASSTHROUGH_HOSTS = {
-    "ws.game.granbluefantasy.jp",
-}
-
-# Endpoints to mock locally with 200 OK
-MOCK_PATHS = (
-    "/rest/error/js",
-    "/user/nickname.woff",
-    "/ob/r",
-)
-
-# Third-party telemetry, ad, and tracking domains to block/mock locally
-TELEMETRY_PATTERNS = (
-    "smbeat.jp",
-    "smrtbeat.com",
-    "rcv.a-i-ad.com",
-    "datadoghq-browser-agent",
-    "datadoghq.com",
-    "spdmg-backend.i-mobile.co.jp",
-    "creativecdn.com",
-    "google-analytics.com",
-    "googletagmanager.com",
-)
-
-# Static asset extensions and path prefixes for cache coverage
-STATIC_EXTENSIONS = (
-    ".png", ".jpg", ".jpeg", ".gif", ".webp",
-    ".mp3", ".wav", ".ogg", ".m4a", ".mp4", ".webm",
-    ".js", ".css", ".woff", ".woff2", ".ttf", ".otf", ".svg", ".ico",
-)
-
-STATIC_PATH_PREFIXES = (
-    "/assets/", "/assets_en/", "/sound/", "/img/", "/css/", "/js/", "/font/",
-)
-
-# Dynamic API prefixes that must NEVER be cached as static assets
-DYNAMIC_API_PREFIXES = (
-    "/rest/", "/quest/", "/party/", "/user/", "/deck/",
-    "/gacha/", "/casino/", "/present/", "/mypage/",
-    "/guild/", "/coopraid/", "/weapon/", "/socket/",
-)
-
-# Global HTTP client pool for upstream requests through Clash
-http_client: Optional[httpx.AsyncClient] = None
-
-# Real-time statistics dictionary for GUI
-PROXY_STATS = {
-    "hits": 0,
-    "ram_hits": 0,
-    "downloads": 0,
-    "apis": 0,
-    "is_running": False,
-    "last_error": "",
-}
-
-proxy_server_instance = None
-proxy_loop = None
-proxy_thread = None
-import threading
+MAX_HEADERS_BYTES = 65536
+MAX_HEADER_COUNT = 128
+MAX_BODY_BYTES = 32 * 1024 * 1024
+http_client = None
+proxy_server_instance = proxy_loop = proxy_thread = proxy_stop_event = None
 proxy_ready_event = threading.Event()
+PROXY_STATS = {"hits": 0, "ram_hits": 0, "downloads": 0, "apis": 0,
+               "is_running": False, "last_error": ""}
 
-def run_proxy_in_thread():
-    global proxy_loop, proxy_server_instance
-    proxy_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(proxy_loop)
-    try:
-        proxy_loop.run_until_complete(main())
-    except (asyncio.CancelledError, KeyboardInterrupt):
-        pass
-    except Exception as e:
-        PROXY_STATS["last_error"] = str(e)
-        PROXY_STATS["is_running"] = False
-        proxy_ready_event.set()
-    finally:
-        PROXY_STATS["is_running"] = False
-        proxy_ready_event.set()
 
-def start_proxy_thread():
-    global proxy_thread
-    proxy_ready_event.clear()
-    PROXY_STATS["last_error"] = ""
-    if proxy_thread and proxy_thread.is_alive():
-        return
-    proxy_thread = threading.Thread(target=run_proxy_in_thread, daemon=True)
-    proxy_thread.start()
-
-def stop_proxy_thread():
-    global proxy_loop, proxy_server_instance, proxy_thread
-    PROXY_STATS["is_running"] = False
-    proxy_ready_event.clear()
-    if proxy_server_instance:
-        try:
-            proxy_server_instance.close()
-        except Exception:
-            pass
-    if proxy_loop and proxy_loop.is_running():
-        try:
-            for task in asyncio.all_tasks(proxy_loop):
-                task.cancel()
-            proxy_loop.call_soon_threadsafe(proxy_loop.stop)
-        except Exception:
-            pass
-    if proxy_thread and proxy_thread.is_alive():
-        try:
-            proxy_thread.join(timeout=1.5)
-        except Exception:
-            pass
-    proxy_thread = None
-
-def format_log(level: str, color_code: str, msg: str):
-    # ANSI colored console log (safe for windowed GUI mode)
-    try:
-        if sys.stdout is not None:
-            print(f"[{level}] {msg}")
-    except Exception:
+class NoCookies(CookieJar):
+    """Reuse TCP connections, never browser identity."""
+    def extract_cookies(self, response, request):
         pass
 
-async def init_http_client():
+    def add_cookie_header(self, request):
+        pass
+
+    def set_cookie(self, cookie, *args, **kwargs):
+        pass
+
+
+class HTTPError(Exception):
+    def __init__(self, status, message):
+        self.status = status
+        super().__init__(message)
+
+
+@dataclass
+class Response:
+    status_code: int
+    headers: httpx.Headers
+    content: bytes
+    reason_phrase: str = ""
+
+
+def format_log(level, color, message):
+    if sys.stdout is not None:
+        try:
+            print(f"[{level}] {message}", flush=True)
+        except (OSError, UnicodeError):
+            pass
+
+
+async def init_http_client(*, transport=None, verify=None):
     global http_client
-    verify_tls = config_manager.config.get("verify_upstream_tls", True)
-    limits = httpx.Limits(max_keepalive_connections=50, max_connections=100, keepalive_expiry=60.0)
+    upstream = normalize_upstream(UPSTREAM_PROXY)
+    verify = config_manager.config.get("verify_upstream_tls", True) if verify is None else verify
     http_client = httpx.AsyncClient(
-        proxy=UPSTREAM_PROXY,
-        verify=verify_tls,
-        timeout=httpx.Timeout(15.0, connect=8.0),
-        limits=limits,
-        follow_redirects=False,
+        proxy=None if upstream == "direct" else upstream, verify=verify,
+        trust_env=False, cookies=NoCookies(), transport=transport,
+        timeout=httpx.Timeout(20.0, connect=8.0), follow_redirects=False,
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
     )
+
 
 async def close_http_client():
     global http_client
-    if http_client:
-        await http_client.aclose()
-
-async def pipe_stream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    try:
-        while not reader.at_eof():
-            data = await reader.read(65536)
-            if not data:
-                break
-            writer.write(data)
-            await writer.drain()
-    except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError):
-        pass
-    except Exception:
-        pass
-    finally:
+    if http_client is not None:
+        client, http_client = http_client, None
         try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:
+            await asyncio.wait_for(client.aclose(), 3)
+        except (TimeoutError, OSError):
             pass
 
-async def handle_passthrough(client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter, target_host: str, target_port: int):
-    """Tunnel raw TCP via Clash upstream for WebSockets and non-MITM hosts."""
+
+async def _line(reader, timeout=15):
     try:
-        # Connect to upstream proxy (Clash/v2rayN)
-        parsed = urllib.parse.urlparse(UPSTREAM_PROXY)
-        proxy_h = parsed.hostname or "127.0.0.1"
-        proxy_p = parsed.port or 7897
-        upstream_reader, upstream_writer = await asyncio.wait_for(
-            asyncio.open_connection(proxy_h, proxy_p),
-            timeout=8.0,
-        )
-        connect_req = f"CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n\r\n"
-        upstream_writer.write(connect_req.encode("ascii"))
-        await upstream_writer.drain()
+        return await asyncio.wait_for(reader.readline(), timeout)
+    except (ValueError, asyncio.LimitOverrunError):
+        raise HTTPError(431, "HTTP line too long") from None
 
-        # Read CONNECT response from Clash
-        resp_line = await asyncio.wait_for(upstream_reader.readline(), timeout=10.0)
-        parts = resp_line.decode("iso-8859-1", errors="replace").strip().split()
-        if len(parts) < 2 or parts[1] != "200":
-            client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            await client_writer.drain()
-            client_writer.close()
-            return
 
-        while True:
-            line = await upstream_reader.readline()
-            if line in (b"\r\n", b"\n", b""):
-                break
-
-        # Acknowledge to client
-        client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        await client_writer.drain()
-
-        format_log("BYPASS-TCP", "36", f"Tunneling {target_host}:{target_port} via upstream")
-
-        # Bidirectional raw TCP piping
-        await asyncio.gather(
-            pipe_stream(client_reader, upstream_writer),
-            pipe_stream(upstream_reader, client_writer),
-            return_exceptions=True,
-        )
-    except Exception as e:
-        try:
-            client_writer.close()
-        except Exception:
-            pass
-
-async def read_http_request(reader: asyncio.StreamReader) -> Optional[Tuple[str, str, str, Dict[str, str], bytes]]:
-    """Read and parse a full HTTP request with Chunked support and timeouts."""
+async def _exact(reader, count, timeout=30):
     try:
-        req_line = await asyncio.wait_for(reader.readline(), timeout=30.0)
-    except (asyncio.TimeoutError, ConnectionResetError, OSError):
-        return None
+        return await asyncio.wait_for(reader.readexactly(count), timeout)
+    except asyncio.IncompleteReadError:
+        raise HTTPError(400, "Incomplete HTTP body") from None
 
-    if not req_line:
-        return None
 
+async def read_http_request(reader, writer=None):
     try:
-        line_str = req_line.decode("iso-8859-1").strip()
-        parts = line_str.split()
-        if len(parts) < 3:
-            return None
-        method, path, version = parts[0], parts[1], parts[2]
-    except Exception:
+        first = await _line(reader, 30)
+    except TimeoutError:
+        return None  # An idle keep-alive connection has no failed request to answer.
+    if not first:
         return None
-
-    headers: Dict[str, str] = {}
-    total_header_bytes = len(req_line)
-    MAX_HEADERS_BYTES = 64 * 1024  # 64KB max header
-    MAX_HEADER_COUNT = 128
-
+    try:
+        method, target, version = first.decode("ascii").strip().split()
+    except (UnicodeError, ValueError):
+        raise HTTPError(400, "Invalid request line") from None
+    if version not in ("HTTP/1.0", "HTTP/1.1") or not method.isalpha():
+        raise HTTPError(400, "Unsupported HTTP request")
+    headers, total, count = {}, len(first), 0
     while True:
-        try:
-            header_line = await asyncio.wait_for(reader.readline(), timeout=15.0)
-        except (asyncio.TimeoutError, ConnectionResetError, OSError):
-            return None
-
-        if not header_line or header_line in (b"\r\n", b"\n"):
+        line = await _line(reader)
+        if line == b"\r\n":
             break
-
-        total_header_bytes += len(header_line)
-        if total_header_bytes > MAX_HEADERS_BYTES or len(headers) > MAX_HEADER_COUNT:
-            return None
-
-        try:
-            h_str = header_line.decode("iso-8859-1").strip()
-            if ":" in h_str:
-                k, v = h_str.split(":", 1)
-                headers[k.strip().lower()] = v.strip()
-        except Exception:
-            pass
-
-    body = b""
-    MAX_BODY_BYTES = 32 * 1024 * 1024  # 32MB max body
-
-    # 1. Handle Chunked Transfer-Encoding
-    if "chunked" in headers.get("transfer-encoding", "").lower():
-        chunks = []
-        total_chunk_bytes = 0
-        while True:
-            try:
-                chunk_line = await asyncio.wait_for(reader.readline(), timeout=15.0)
-            except (asyncio.TimeoutError, ConnectionResetError, OSError):
-                return None
-            if not chunk_line:
-                break
-            chunk_line_str = chunk_line.decode("iso-8859-1").strip().split(";")[0]
-            if not chunk_line_str:
-                continue
-            try:
-                chunk_size = int(chunk_line_str, 16)
-            except ValueError:
-                return None
-
-            if chunk_size == 0:
-                # Consume trailing trailer/empty line
-                try:
-                    await asyncio.wait_for(reader.readline(), timeout=5.0)
-                except Exception:
-                    pass
-                break
-
-            if total_chunk_bytes + chunk_size > MAX_BODY_BYTES:
-                return None
-
-            try:
-                chunk_data = await asyncio.wait_for(reader.readexactly(chunk_size), timeout=15.0)
-                # Consume trailing \r\n after chunk data
-                await asyncio.wait_for(reader.readline(), timeout=5.0)
-            except (asyncio.TimeoutError, ConnectionResetError, OSError):
-                return None
-
-            chunks.append(chunk_data)
-            total_chunk_bytes += chunk_size
-
-        body = b"".join(chunks)
-
-    # 2. Handle standard Content-Length
-    else:
-        try:
-            content_length = int(headers.get("content-length", 0))
-        except ValueError:
-            return None
-
-        if content_length > MAX_BODY_BYTES:
-            return None
-
-        if content_length > 0:
-            try:
-                body = await asyncio.wait_for(reader.readexactly(content_length), timeout=30.0)
-            except (asyncio.TimeoutError, ConnectionResetError, OSError):
-                return None
-
-    return method, path, version, headers, body
-
-async def send_cached_response(
-    writer: asyncio.StreamWriter,
-    status_code: int,
-    status_text: str,
-    headers: Dict[str, str],
-    body: bytes,
-    keep_content_encoding: bool = False,
-    is_head: bool = False,
-):
-    """Send HTTP response for local cache hits, mock endpoints, preflights, or synthetic errors."""
-    filtered_headers: Dict[str, str] = {}
-    for k, v in headers.items():
-        k_lower = k.lower()
-        if k_lower in ("content-length", "transfer-encoding", "connection"):
-            continue
-        if not keep_content_encoding and k_lower == "content-encoding":
-            continue
-        filtered_headers[k_lower] = v
-
-    filtered_headers["content-length"] = str(len(body))
-    filtered_headers["connection"] = "keep-alive"
-    # Ensure CORS is allowed for locally mocked or cached static assets
-    filtered_headers["access-control-allow-origin"] = "*"
-
-    res_lines = [f"HTTP/1.1 {status_code} {status_text}"]
-    for k, v in filtered_headers.items():
-        res_lines.append(f"{k}: {v}")
-
-    raw_header = ("\r\n".join(res_lines) + "\r\n\r\n").encode("iso-8859-1")
-    if is_head:
-        writer.write(raw_header)
-    else:
-        writer.write(raw_header + body)
-    await writer.drain()
-
-async def forward_upstream_response(
-    writer: asyncio.StreamWriter,
-    client_headers: Dict[str, str],
-    upstream_resp: httpx.Response,
-) -> bool:
-    """Forward dynamic API response strictly preserving original upstream headers without CORS tampering."""
-    # Since httpx automatically decompresses content into upstream_resp.content,
-    # content-encoding must be stripped so clients don't attempt double decompression.
-    hop_by_hop = {"transfer-encoding", "trailer", "te", "upgrade", "content-encoding"}
-    out_headers: Dict[str, str] = {}
-
-    for k, v in upstream_resp.headers.items():
-        k_lower = k.lower()
-        if k_lower in hop_by_hop or k_lower in ("content-length", "set-cookie"):
-            continue
-        out_headers[k_lower] = v
-
-    # Extract all individual Set-Cookie headers without comma-folding
-    cookies = upstream_resp.headers.get_list("set-cookie")
-
-    # Set accurate Content-Length for buffered body
-    out_headers["content-length"] = str(len(upstream_resp.content))
-
-    # Connection negotiation: honor close if requested by client or upstream
-    client_conn = client_headers.get("connection", "").lower()
-    upstream_conn = upstream_resp.headers.get("connection", "").lower()
-    should_close = ("close" in client_conn or "close" in upstream_conn or upstream_resp.http_version == "HTTP/1.0")
-
-    if should_close:
-        out_headers["connection"] = "close"
-    else:
-        out_headers["connection"] = "keep-alive"
-
-    res_lines = [f"HTTP/1.1 {upstream_resp.status_code} {upstream_resp.reason_phrase}"]
-    for k, v in out_headers.items():
-        res_lines.append(f"{k}: {v}")
-
-    # Emit each Set-Cookie as an individual header line
-    for cookie in cookies:
-        res_lines.append(f"Set-Cookie: {cookie}")
-
-    raw_header = ("\r\n".join(res_lines) + "\r\n\r\n").encode("iso-8859-1")
-    writer.write(raw_header + upstream_resp.content)
-    await writer.drain()
-
-    return not should_close
-
-async def handle_mitm_session(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, target_host: str, ssl_context: ssl.SSLContext):
-    """Handle decrypted HTTPS requests for GBF domains."""
+        total, count = total + len(line), count + 1
+        if total > MAX_HEADERS_BYTES or count > MAX_HEADER_COUNT:
+            raise HTTPError(431, "Too many HTTP headers")
+        if not line or not line.endswith(b"\r\n") or line[:1] in (b" ", b"\t") or b":" not in line:
+            raise HTTPError(400, "Invalid HTTP header")
+        key, value = line[:-2].decode("iso-8859-1").split(":", 1)
+        if not key or any(not (c.isascii() and (c.isalnum() or c in "!#$%&'*+-.^_`|~")) for c in key):
+            raise HTTPError(400, "Invalid header name")
+        key, value = key.lower(), value.strip()
+        if any(c in value for c in "\r\n\x00"):
+            raise HTTPError(400, "Invalid header value")
+        if key in headers:
+            if key in ("host", "content-length", "transfer-encoding", "authorization"):
+                raise HTTPError(400, "Ambiguous HTTP framing or identity")
+            headers[key] += ("; " if key == "cookie" else ", ") + value
+        else:
+            headers[key] = value
+    transfer = headers.get("transfer-encoding", "").lower()
+    if transfer and (transfer != "chunked" or "content-length" in headers):
+        raise HTTPError(400, "Unsupported or ambiguous transfer encoding")
     try:
-        # Tell client CONNECT succeeded
-        writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        length = int(headers.get("content-length", "0"))
+    except ValueError:
+        raise HTTPError(400, "Invalid Content-Length") from None
+    if length < 0 or length > MAX_BODY_BYTES:
+        raise HTTPError(413, "Request body exceeds limit")
+    if method.upper() == "CONNECT" and (length or transfer):
+        raise HTTPError(400, "CONNECT cannot carry a request body")
+    expect = headers.pop("expect", "").lower()
+    if expect:
+        if expect != "100-continue" or writer is None:
+            raise HTTPError(417, "Unsupported expectation")
+        writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+        await writer.drain()
+    if not transfer:
+        body = await _exact(reader, length) if length else b""
+    else:
+        chunks, size = [], 0
+        while True:
+            line = await _line(reader)
+            try:
+                raw_size = line.strip().split(b";", 1)[0]
+                if not raw_size or any(c not in b"0123456789abcdefABCDEF" for c in raw_size):
+                    raise ValueError()
+                chunk_size = int(raw_size, 16)
+            except ValueError:
+                raise HTTPError(400, "Invalid chunk size") from None
+            if not chunk_size:
+                while True:
+                    trailer = await _line(reader)
+                    if trailer == b"\r\n":
+                        break
+                    total, count = total + len(trailer), count + 1
+                    if total > MAX_HEADERS_BYTES or count > MAX_HEADER_COUNT:
+                        raise HTTPError(431, "Trailers exceed limit")
+                    if not trailer or b":" not in trailer or not trailer.endswith(b"\r\n"):
+                        raise HTTPError(400, "Invalid trailer")
+                    name = trailer.split(b":", 1)[0].lower()
+                    if name in (b"content-length", b"transfer-encoding", b"host", b"authorization", b"cookie"):
+                        raise HTTPError(400, "Forbidden trailer")
+                break
+            size += chunk_size
+            if size > MAX_BODY_BYTES:
+                raise HTTPError(413, "Request body exceeds limit")
+            chunks.append(await _exact(reader, chunk_size))
+            if await _exact(reader, 2) != b"\r\n":
+                raise HTTPError(400, "Invalid chunk terminator")
+        body = b"".join(chunks)
+    return method.upper(), target, version, headers, body
+
+
+async def send_response(writer, status, headers, body, *, method="GET", close=False):
+    incoming = httpx.Headers(headers)
+    fields = end_to_end_headers(incoming)
+    cookies = incoming.get_list("set-cookie")
+    fields.pop("set-cookie", None)
+    if status in (204, 304) or status < 200:
+        fields.pop("content-length", None)
+        body = b""
+    elif method != "HEAD" or "content-length" not in fields:
+        fields["content-length"] = str(len(body))
+    fields["connection"] = "close" if close else "keep-alive"
+    try:
+        reason = HTTPStatus(status).phrase
+    except ValueError:
+        reason = "Response"
+    lines = [f"HTTP/1.1 {status} {reason}", *[f"{k}: {v}" for k, v in fields.items()]]
+    lines.extend(f"Set-Cookie: {value}" for value in cookies)
+    writer.write(("\r\n".join(lines) + "\r\n\r\n").encode("iso-8859-1"))
+    if method != "HEAD":
+        writer.write(body)
+    await writer.drain()
+
+
+async def fetch_upstream(method, url, headers, body):
+    fields = end_to_end_headers(headers)
+    for name in ("host", "content-length"):
+        fields.pop(name, None)
+    request = http_client.build_request(method, url, headers=fields, content=body)
+    upstream = await http_client.send(request, stream=True)
+    try:
+        maximum = max(1, min(512, int(config_manager.config.get("max_response_mb", 64)))) * 1024 * 1024
+        chunks, size = [], 0
+        async for chunk in upstream.aiter_raw():
+            size += len(chunk)
+            if size > maximum:
+                raise HTTPError(502, "Upstream response exceeds configured limit")
+            chunks.append(chunk)
+        return Response(upstream.status_code, upstream.headers, b"".join(chunks), upstream.reason_phrase)
+    finally:
+        await upstream.aclose()
+
+
+def _etag_matches(condition, etag):
+    return bool(condition and (condition.strip() == "*" or (etag and any(
+        value.strip().removeprefix("W/") == etag.removeprefix("W/") for value in condition.split(",")))))
+
+
+def preserve_cookies(fields, original):
+    result = httpx.Headers(fields)
+    cookies = original.get_list("set-cookie")
+    result.pop("set-cookie", None)
+    return httpx.Headers([*result.multi_items(), *[("set-cookie", cookie) for cookie in cookies]])
+
+
+async def handle_http(req, writer, target_host=None):
+    method, target, version, headers, body = req
+    close = version == "HTTP/1.0" or "close" in headers.get("connection", "").lower()
+    if target_host:
+        if not target.startswith("/") or target.startswith("//") or "#" in target:
+            raise HTTPError(400, "MITM requests must use origin-form targets")
+        host_header = headers.get("host", target_host).lower()
+        if host_header not in (target_host, target_host + ":443"):
+            raise HTTPError(400, "Host differs from CONNECT target")
+        url = f"https://{target_host}{target}"
+    else:
+        parsed = urllib.parse.urlsplit(target)
+        if parsed.scheme != "http" or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+            raise HTTPError(400, "Expected absolute HTTP URL")
+        url = target
+    # HTTPX normalizes the exact URL used for the upstream request and cache key.
+    url = str(httpx.URL(url))
+    eligible = cacheable_request(method, url, headers)
+    if eligible:
+        cached = await asyncio.to_thread(cache_manager.get_cache, url, headers)
+        if cached:
+            chosen = representation(*cached, headers.get("accept-encoding"))
+            if chosen:
+                fields, data = chosen
+                status = 304 if _etag_matches(headers.get("if-none-match"), fields.get("etag")) else 200
+                await send_response(writer, status, fields, data, method=method, close=close)
+                PROXY_STATS["hits"] += 1
+                PROXY_STATS["ram_hits"] += fields.get("x-cache-source") == "RAM"
+                format_log("CACHE", "", f"{method} {urllib.parse.urlsplit(url).hostname}{urllib.parse.urlsplit(url).path}")
+                return not close
+    candidate = None
+    upstream_headers = dict(headers)
+    if eligible and method == "GET" and not any(k in headers for k in ("if-none-match", "if-modified-since")):
+        candidate = await asyncio.to_thread(cache_manager.get_cache, url, headers, True)
+        if candidate and representation(*candidate, headers.get("accept-encoding")):
+            if candidate[0].get("etag"):
+                upstream_headers["if-none-match"] = candidate[0]["etag"]
+            elif candidate[0].get("last-modified"):
+                upstream_headers["if-modified-since"] = candidate[0]["last-modified"]
+            else:
+                candidate = None
+        else:
+            candidate = None
+    response = await fetch_upstream(method, url, upstream_headers, body)
+    if response.status_code == 304 and candidate is not None:
+        fields, data = candidate
+        fields = {k: v for k, v in fields.items() if k not in ("age", "x-proxy-cache", "x-cache-source", "content-length")}
+        # The origin's validation replaces the legacy placeholder policy.
+        if fields.get("cache-control") == "no-cache" and candidate[0].get("x-cache-source") == "LEGACY":
+            fields.pop("cache-control", None)
+        fields.update(end_to_end_headers(response.headers))
+        merged = preserve_cookies(fields, response.headers)
+        response = Response(200, merged, data)
+    if eligible and method == "GET" and response.status_code == 200:
+        saved = await asyncio.to_thread(cache_manager.save_cache, url, dict(response.headers), response.content, headers)
+        if saved:
+            PROXY_STATS["downloads"] += 1
+        else:
+            await asyncio.to_thread(cache_manager.invalidate, url)
+    elif eligible and method == "GET" and response.status_code != 304:
+        await asyncio.to_thread(cache_manager.invalidate, url)
+    fields, data = response.headers, response.content
+    if eligible and response.status_code == 200 and method != "HEAD":
+        chosen = representation(dict(fields), data, headers.get("accept-encoding"))
+        if chosen is None:
+            await send_response(writer, 406, {}, b"", method=method, close=close)
+            return not close
+        fields, data = chosen
+        fields = preserve_cookies(fields, response.headers)
+    close = close or "close" in response.headers.get("connection", "").lower()
+    await send_response(writer, response.status_code, fields, data, method=method, close=close)
+    PROXY_STATS["apis"] += not eligible
+    parts = urllib.parse.urlsplit(url)
+    format_log("FETCH" if eligible else "BYPASS", "", f"{response.status_code} {method} {parts.hostname}{parts.path}")
+    return not close
+
+
+async def open_target_tunnel(host, port, *, proxy_tls_context=None):
+    """Return a raw target stream through the configured uplink."""
+    upstream = normalize_upstream(UPSTREAM_PROXY)
+    if upstream == "direct":
+        return await asyncio.wait_for(asyncio.open_connection(host, port), 8)
+    parsed = urllib.parse.urlsplit(upstream)
+    proxy_port = parsed.port or {"http": 80, "https": 443, "socks5": 1080, "socks5h": 1080}[parsed.scheme]
+    tls = (proxy_tls_context or ssl.create_default_context()) if parsed.scheme == "https" else None
+    reader, writer = await asyncio.wait_for(asyncio.open_connection(parsed.hostname, proxy_port, ssl=tls,
+                                          server_hostname=parsed.hostname if tls else None), 8)
+    try:
+        if parsed.scheme in ("socks5", "socks5h"):
+            credentials = parsed.username is not None
+            writer.write(b"\x05\x01\x02" if credentials else b"\x05\x01\x00")
+            await writer.drain()
+            selected = await _exact(reader, 2, 8)
+            if selected != (b"\x05\x02" if credentials else b"\x05\x00"):
+                raise HTTPError(502, "SOCKS authentication method rejected")
+            if credentials:
+                user = urllib.parse.unquote(parsed.username).encode()
+                password = urllib.parse.unquote(parsed.password or "").encode()
+                if len(user) > 255 or len(password) > 255:
+                    raise HTTPError(502, "SOCKS credentials exceed protocol limits")
+                writer.write(b"\x01" + bytes([len(user)]) + user + bytes([len(password)]) + password)
+                await writer.drain()
+                if await _exact(reader, 2, 8) != b"\x01\x00":
+                    raise HTTPError(502, "SOCKS authentication failed")
+            try:
+                address = ipaddress.ip_address(host)
+                destination = (b"\x01" if address.version == 4 else b"\x04") + address.packed
+            except ValueError:
+                domain = host.encode("idna")
+                if len(domain) > 255:
+                    raise HTTPError(400, "SOCKS target hostname too long")
+                destination = b"\x03" + bytes([len(domain)]) + domain
+            writer.write(b"\x05\x01\x00" + destination + port.to_bytes(2, "big"))
+            await writer.drain()
+            result = await _exact(reader, 4, 8)
+            if result[:3] != b"\x05\x00\x00":
+                raise HTTPError(502, "SOCKS connection rejected")
+            length = {1: 4, 4: 16}.get(result[3])
+            if result[3] == 3:
+                length = (await _exact(reader, 1, 8))[0]
+            if length is None:
+                raise HTTPError(502, "Invalid SOCKS reply")
+            await _exact(reader, length + 2, 8)
+        else:
+            authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+            lines = [f"CONNECT {authority} HTTP/1.1", f"Host: {authority}"]
+            if parsed.username is not None:
+                raw = urllib.parse.unquote(parsed.username) + ":" + urllib.parse.unquote(parsed.password or "")
+                lines.append("Proxy-Authorization: Basic " + base64.b64encode(raw.encode()).decode())
+            writer.write(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
+            await writer.drain()
+            first = await _line(reader, 8)
+            parts = first.split()
+            if len(parts) < 2 or parts[1] != b"200":
+                raise HTTPError(502, "HTTP upstream CONNECT rejected")
+            total = len(first)
+            while True:
+                line = await _line(reader, 8)
+                total += len(line)
+                if total > MAX_HEADERS_BYTES or not line:
+                    raise HTTPError(502, "Invalid upstream CONNECT headers")
+                if line == b"\r\n":
+                    break
+        return reader, writer
+    except BaseException:
+        writer.close()
+        raise
+
+
+async def pipe_stream(reader, writer):
+    while True:
+        data = await reader.read(65536)
+        if not data:
+            return
+        writer.write(data)
         await writer.drain()
 
-        # Upgrade connection to TLS
-        await writer.start_tls(ssl_context)
-    except Exception as e:
-        format_log("TLS-ERR", "31", f"Handshake failed with client for {target_host}: {e}")
-        try:
-            writer.close()
-        except Exception:
-            pass
-        return
 
-    # Loop to handle HTTP Keep-Alive requests on this TLS connection
+async def close_writer(writer):
+    writer.close()
+    try:
+        await asyncio.wait_for(writer.wait_closed(), 2)
+    except (TimeoutError, OSError, RuntimeError):
+        writer.transport.abort()
+
+
+async def relay(client_reader, client_writer, upstream_reader, upstream_writer):
+    tasks = [asyncio.create_task(pipe_stream(client_reader, upstream_writer)),
+             asyncio.create_task(pipe_stream(upstream_reader, client_writer))]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(close_writer(upstream_writer), close_writer(client_writer), return_exceptions=True)
+
+
+async def handle_passthrough(reader, writer, host, port):
+    upstream_reader, upstream_writer = await open_target_tunnel(host, port)
+    writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+    await writer.drain()
+    await relay(reader, writer, upstream_reader, upstream_writer)
+
+
+async def handle_mitm_session(reader, writer, host, ssl_context):
+    writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+    await writer.drain()
+    await asyncio.wait_for(writer.start_tls(ssl_context, ssl_shutdown_timeout=2), 10)
     while True:
-        try:
-            req = await read_http_request(reader)
-            if not req:
-                break
-            method, path, version, headers, body = req
-
-            # ---------------- Rule 1: CORS OPTIONS ----------------
-            if method.upper() == "OPTIONS":
-                cors_headers = {
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-                    "Access-Control-Allow-Headers": "*",
-                    "Access-Control-Max-Age": "604800",
-                    "Connection": "keep-alive",
-                }
-                await send_cached_response(writer, 200, "OK", cors_headers, b"")
-                format_log("OPTIONS", "35", f"CORS Preflight Mock -> {target_host}{path}")
-                continue
-
-            # ---------------- Rule 2: Mock Endpoints ----------------
-            if target_host.endswith("granbluefantasy.jp") and path.startswith(MOCK_PATHS):
-                mock_headers = {
-                    "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*",
-                    "Connection": "keep-alive",
-                }
-                await send_cached_response(writer, 200, "OK", mock_headers, b'{"success":true}')
-                err_msg = ""
-                if "error" in path and body:
-                    try:
-                        err_msg = f" (err: {body.decode('utf-8', errors='ignore')[:120]})"
-                    except Exception:
-                        pass
-                format_log("MOCK-200", "33", f"Direct Mock -> {path}{err_msg}")
-                continue
-
-            # ---------------- Rule 3: Static Asset Cache (Strict & Safe) ----------------
-            clean_path_lower = path.split("?")[0].lower()
-            is_static = (
-                method.upper() in ("GET", "HEAD")
-                and not path.startswith(DYNAMIC_API_PREFIXES)
-                and (
-                    "akamaized.net" in target_host
-                    or target_host.startswith("game-a")
-                    or path.startswith(STATIC_PATH_PREFIXES)
-                    or any(clean_path_lower.endswith(ext) for ext in STATIC_EXTENSIONS)
-                )
-            )
-
-            if is_static:
-                is_head = (method.upper() == "HEAD")
-                cache_hit = cache_manager.get_cache(path)
-                if cache_hit:
-                    c_headers, c_data = cache_hit
-                    is_ram = c_headers.get("X-Cache-Source") == "RAM"
-                    # Check 304 Not Modified from browser cache
-                    req_etag = headers.get("if-none-match", "")
-                    if req_etag and req_etag == c_headers.get("ETag"):
-                        not_mod_headers = {
-                            "ETag": c_headers["ETag"],
-                            "Cache-Control": c_headers["Cache-Control"],
-                            "Access-Control-Allow-Origin": "*",
-                            "Connection": "keep-alive",
-                        }
-                        await send_cached_response(writer, 304, "Not Modified", not_mod_headers, b"", is_head=is_head)
-                        PROXY_STATS["hits"] += 1
-                        if is_ram:
-                            PROXY_STATS["ram_hits"] += 1
-                        format_log(f"CACHE-{'RAM' if is_ram else 'DISK'}", "32", f"304 Not Modified -> {path}")
-                        continue
-
-                    await send_cached_response(writer, 200, "OK", c_headers, c_data, keep_content_encoding=True, is_head=is_head)
-                    PROXY_STATS["hits"] += 1
-                    if is_ram:
-                        PROXY_STATS["ram_hits"] += 1
-                    format_log(f"CACHE-{'RAM' if is_ram else 'DISK'}", "32", f"HIT -> {path} ({len(c_data):,} B)")
-                    continue
-
-                # Cache MISS: fetch via Clash, save & compress
-                start_t = time.perf_counter()
-                url = f"https://{target_host}{path}"
-                clean_headers = {k: v for k, v in headers.items() if k not in ("host", "content-length", "if-modified-since", "if-none-match")}
-                try:
-                    resp = await http_client.request(method, url, headers=clean_headers, content=body)
-                except httpx.TimeoutException:
-                    format_log("TIMEOUT", "31", f"Timeout fetching asset -> {url}")
-                    err_body = b'{"error": "Upstream Gateway Timeout", "code": 504}'
-                    await send_cached_response(writer, 504, "Gateway Timeout", {"Content-Type": "application/json"}, err_body)
-                    continue
-                except Exception as e:
-                    format_log("ERROR", "31", f"Error fetching asset -> {url}: {e}")
-                    err_body = b'{"error": "Bad Gateway", "code": 502}'
-                    await send_cached_response(writer, 502, "Bad Gateway", {"Content-Type": "application/json"}, err_body)
-                    continue
-
-                elapsed_ms = int((time.perf_counter() - start_t) * 1000)
-
-                if resp.status_code == 200 and resp.content:
-                    saved = cache_manager.save_cache(path, dict(resp.headers), resp.content)
-                    if saved:
-                        PROXY_STATS["downloads"] += 1
-                        format_log("FETCH-ASSET", "34", f"200 OK & CACHED ({elapsed_ms}ms) -> {path}")
-                        verified_cache = cache_manager.get_cache(path)
-                        if verified_cache:
-                            c_headers, c_data = verified_cache
-                            await send_cached_response(writer, 200, "OK", c_headers, c_data, keep_content_encoding=True, is_head=is_head)
-                            continue
-
-                # Fallback if non-200 or unable to cache
-                keep_alive = await forward_upstream_response(writer, headers, resp)
-                if not keep_alive:
-                    break
-                continue
-
-            # ---------------- Rule 4: Dynamic Game API (100% Pristine Forwarding) ----------------
-            start_t = time.perf_counter()
-            url = f"https://{target_host}{path}"
-            clean_headers = {k: v for k, v in headers.items() if k not in ("host", "content-length")}
-            try:
-                resp = await http_client.request(method, url, headers=clean_headers, content=body)
-            except httpx.TimeoutException:
-                format_log("TIMEOUT", "31", f"API Gateway Timeout -> {method} {path}")
-                err_body = b'{"error": "Upstream API Gateway Timeout", "code": 504}'
-                await send_cached_response(writer, 504, "Gateway Timeout", {"Content-Type": "application/json"}, err_body)
-                continue
-            except Exception as e:
-                format_log("API-ERR", "31", f"API Forward Error -> {method} {path}: {e}")
-                err_body = b'{"error": "Bad Gateway", "code": 502}'
-                await send_cached_response(writer, 502, "Bad Gateway", {"Content-Type": "application/json"}, err_body)
-                continue
-
-            elapsed_ms = int((time.perf_counter() - start_t) * 1000)
-            keep_alive = await forward_upstream_response(writer, headers, resp)
-            PROXY_STATS["apis"] += 1
-
-            # Highlight slow API responses (>300ms) or errors
-            color = "31" if resp.status_code >= 400 else ("33" if elapsed_ms > 300 else "37")
-            format_log("BYPASS-API", color, f"{resp.status_code} {method} {target_host}{path} ({elapsed_ms}ms)")
-
-            if not keep_alive:
-                break
-
-        except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError):
-            break
-        except Exception as e:
-            format_log("SESSION-ERR", "31", f"Unexpected session error on {target_host}: {e}")
-            break
-
-    try:
-        writer.close()
-        await writer.wait_closed()
-    except Exception:
-        pass
-
-async def client_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, ssl_context: ssl.SSLContext):
-    """Entrypoint for all client connections."""
-    try:
-        first_line = await reader.readline()
-        if not first_line:
-            writer.close()
+        request = await read_http_request(reader, writer)
+        if request is None:
+            return
+        if not await handle_http(request, writer, host):
             return
 
-        parts = first_line.decode("iso-8859-1").strip().split()
-        if len(parts) < 2:
-            writer.close()
+
+async def client_handler(reader, writer, ssl_context):
+    try:
+        request = await read_http_request(reader, writer)
+        if request is None:
             return
-
-        method, target = parts[0].upper(), parts[1]
-
+        method, target, _, _, _ = request
         if method == "CONNECT":
-            # Read remaining initial headers
-            while True:
-                line = await reader.readline()
-                if not line or line in (b"\r\n", b"\n"):
-                    break
-
-            # Block telemetry tunnels immediately
-            if any(pat in target for pat in TELEMETRY_PATTERNS):
-                writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                await writer.drain()
-                writer.close()
-                format_log("BLOCK", "90", f"Blocked telemetry tunnel: {target}")
-                return
-
-            # CONNECT host:port
-            if ":" in target:
-                host, port_str = target.split(":", 1)
-                port = int(port_str)
-            else:
-                host, port = target, 443
-
-            # Determine whether to MITM or Passthrough (strictly scope Akamai to GBF subdomains)
-            is_gbf_akamaized = ("granbluefantasy.akamaized.net" in host or "gbf.akamaized.net" in host)
-            should_mitm = (
-                host not in PASSTHROUGH_HOSTS
-                and "analytics" not in host
-                and (
-                    is_gbf_akamaized
-                    or any(host == s or host.endswith("." + s) for s in ("granbluefantasy.jp", "granbluefantasy.com", "mbga.jp"))
-                )
-            )
-
-            if should_mitm:
+            try:
+                parsed = urllib.parse.urlsplit("//" + target)
+                host, port = normalize_host(parsed.hostname or ""), parsed.port or 443
+                if not host or parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment or not 1 <= port <= 65535:
+                    raise ValueError()
+            except ValueError:
+                raise HTTPError(400, "Invalid CONNECT authority") from None
+            if should_mitm(host, port):
                 await handle_mitm_session(reader, writer, host, ssl_context)
             else:
                 await handle_passthrough(reader, writer, host, port)
+        elif target == "/proxy.pac" and method in ("GET", "HEAD"):
+            from app_main import get_pac_content
+            await send_response(writer, 200, {"content-type": "application/x-ns-proxy-autoconfig", "cache-control": "no-cache"},
+                                get_pac_content(LISTEN_PORT).encode(), method=method, close=True)
         else:
-            # 1. Check if client is requesting the local PAC script
-            if target == "/proxy.pac" or target.endswith("/proxy.pac"):
-                from app_main import get_pac_content
-                pac_bytes = get_pac_content(LISTEN_PORT).encode("utf-8")
-                pac_headers = {
-                    "Content-Type": "application/x-ns-proxy-autoconfig",
-                    "Content-Length": str(len(pac_bytes)),
-                    "Access-Control-Allow-Origin": "*",
-                    "Cache-Control": "no-cache",
-                    "Connection": "close",
-                }
-                await send_cached_response(writer, 200, "OK", pac_headers, pac_bytes)
-                format_log("PAC", "36", f"Served /proxy.pac (port {LISTEN_PORT}) to browser/system")
-                writer.close()
-                await writer.wait_closed()
-                return
-
-            # 2. Block plain HTTP telemetry requests
-            if any(pat in target for pat in TELEMETRY_PATTERNS):
-                await send_cached_response(writer, 200, "OK", {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Content-Length": "2", "Connection": "close"}, b"{}")
-                writer.close()
-                await writer.wait_closed()
-                return
-
-            # Plain HTTP request (e.g. GET http://gbf.game.mbga.jp/...)
-            headers: Dict[str, str] = {}
-            while True:
-                line = await reader.readline()
-                if not line or line in (b"\r\n", b"\n"):
+            while await handle_http(request, writer):
+                request = await read_http_request(reader, writer)
+                if request is None:
                     break
-                try:
-                    h_str = line.decode("iso-8859-1").strip()
-                    if ":" in h_str:
-                        k, v = h_str.split(":", 1)
-                        headers[k.strip().lower()] = v.strip()
-                except Exception:
-                    pass
-
-            content_length = int(headers.get("content-length", 0))
-            body = await reader.readexactly(content_length) if content_length > 0 else b""
-
-            clean_headers = {k: v for k, v in headers.items() if k not in ("host", "content-length")}
-            resp = await http_client.request(method, target, headers=clean_headers, content=body)
-            await forward_upstream_response(writer, headers, resp)
-            format_log(f"HTTP {resp.status_code}", "37", f"{method} {target}")
-            writer.close()
-            await writer.wait_closed()
-
-    except Exception:
+    except asyncio.CancelledError:
+        raise
+    except (HTTPError, httpx.HTTPError, OSError, ValueError, asyncio.TimeoutError) as exc:
+        status = exc.status if isinstance(exc, HTTPError) else 504 if isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException)) else 502
         try:
-            writer.close()
-        except Exception:
+            await send_response(writer, status, {"content-type": "text/plain"}, HTTPStatus(status).phrase.encode(), close=True)
+        except (OSError, RuntimeError):
             pass
+        format_log("ERROR", "", f"{status} {type(exc).__name__}")
+    finally:
+        await close_writer(writer)
+
 
 async def main():
-    if config_manager.config.get("clean_zombies", True):
-        kill_process_on_port(LISTEN_PORT)
-
+    global proxy_loop, proxy_stop_event, proxy_server_instance
+    if LISTEN_HOST not in ("127.0.0.1", "::1"):
+        raise ValueError("仅允许监听本机回环地址")
+    proxy_loop = asyncio.get_running_loop()
+    proxy_stop_event = asyncio.Event()
+    clients = set()
+    server = None
     try:
-        if sys.stdout is not None:
-            print("=" * 65)
-            print("   GBF Speed Proxy - 本地极速缓存与加速代理")
-            print(f"   本地监听: http://{LISTEN_HOST}:{LISTEN_PORT}")
-            print(f"   上游转发: {UPSTREAM_PROXY}")
-            print(f"   静态缓存: {cache_manager.cache_base}")
-            print("=" * 65)
-    except Exception:
-        pass
-
-    # Suppress unsightly Proactor connection reset noise on Windows
-    loop = asyncio.get_running_loop()
-    def custom_exception_handler(l, ctx):
-        exc = ctx.get("exception")
-        if isinstance(exc, (ConnectionResetError, BrokenPipeError)):
-            return
-        l.default_exception_handler(ctx)
-    loop.set_exception_handler(custom_exception_handler)
-
-    await init_http_client()
-    ssl_context = get_server_ssl_context()
-
-    server = await asyncio.start_server(
-        lambda r, w: client_handler(r, w, ssl_context),
-        LISTEN_HOST,
-        LISTEN_PORT,
-    )
-
-    global proxy_server_instance
-    proxy_server_instance = server
-    PROXY_STATS["is_running"] = True
-    PROXY_STATS["last_error"] = ""
-    proxy_ready_event.set()
-
-    format_log("READY", "32", f"代理服务已成功启动！等待 GBF 请求接入...\n")
-
-    try:
+        await init_http_client()
+        ssl_context = get_server_ssl_context()
+        def accept(reader, writer):
+            task = asyncio.create_task(client_handler(reader, writer, ssl_context))
+            clients.add(task)
+            task.add_done_callback(clients.discard)
+        server = await asyncio.start_server(accept, LISTEN_HOST, LISTEN_PORT)
+        proxy_server_instance = server
+        PROXY_STATS["is_running"], PROXY_STATS["last_error"] = True, ""
+        proxy_ready_event.set()
+        format_log("READY", "", f"http://{LISTEN_HOST}:{LISTEN_PORT}; uplink={urllib.parse.urlsplit(UPSTREAM_PROXY).hostname or 'direct'}")
         async with server:
-            await server.serve_forever()
+            await proxy_stop_event.wait()
     finally:
-        PROXY_STATS["is_running"] = False
-        proxy_ready_event.clear()
+        if server:
+            server.close()
+            await server.wait_closed()
+        for task in list(clients):
+            task.cancel()
+        await asyncio.gather(*list(clients), return_exceptions=True)
         await close_http_client()
+        proxy_server_instance = None
+        PROXY_STATS["is_running"] = False
+        proxy_ready_event.set()
 
-if __name__ == "__main__":
+
+def run_proxy_in_thread():
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n[*] GBF Speed Proxy 已经安全停止。")
+    except Exception as exc:
+        PROXY_STATS["last_error"] = str(exc)
+    finally:
+        PROXY_STATS["is_running"] = False
+        proxy_ready_event.set()
+
+
+def start_proxy_thread():
+    global proxy_thread
+    if proxy_thread and proxy_thread.is_alive():
+        return
+    proxy_ready_event.clear()
+    PROXY_STATS["last_error"] = ""
+    proxy_thread = threading.Thread(target=run_proxy_in_thread, daemon=True)
+    proxy_thread.start()
+
+
+def stop_proxy_thread():
+    global proxy_thread
+    if proxy_loop and proxy_loop.is_running() and proxy_stop_event:
+        proxy_loop.call_soon_threadsafe(proxy_stop_event.set)
+    if proxy_thread and proxy_thread.is_alive():
+        proxy_thread.join(timeout=8)
+        if proxy_thread.is_alive():
+            raise RuntimeError("代理尚未停止，请稍候重试")
+    proxy_thread = None
+
+
+if __name__ == "__main__":
+    from app_main import main as cli_main
+    cli_main()

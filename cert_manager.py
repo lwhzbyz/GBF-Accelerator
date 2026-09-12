@@ -7,33 +7,17 @@ from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from config_manager import get_base_dir
+from config_manager import get_data_dir
+from network_policy import MITM_HOSTS
 
-CERTS_DIR = get_base_dir() / "certs"
+CERTS_DIR = get_data_dir() / "certs"
 CA_CERT_PATH = CERTS_DIR / "ca.crt"
 CA_KEY_PATH = CERTS_DIR / "ca.key"
 SERVER_CERT_PATH = CERTS_DIR / "server.crt"
 SERVER_KEY_PATH = CERTS_DIR / "server.key"
 
 # Strictly scoped GBF domains for Server Certificate SAN (RFC 6125 compliant, no broad *.akamaized.net)
-SAN_DOMAINS = [
-    "*.granbluefantasy.jp",
-    "granbluefantasy.jp",
-    "*.granbluefantasy.com",
-    "granbluefantasy.com",
-    "*.mbga.jp",
-    "mbga.jp",
-    "prd-game-a-granbluefantasy.akamaized.net",
-    "prd-game-a1-granbluefantasy.akamaized.net",
-    "prd-game-a2-granbluefantasy.akamaized.net",
-    "prd-game-a3-granbluefantasy.akamaized.net",
-    "prd-game-a4-granbluefantasy.akamaized.net",
-    "prd-game-a5-granbluefantasy.akamaized.net",
-    "gbf.akamaized.net",
-    "*.gbf.akamaized.net",
-    "granbluefantasy.akamaized.net",
-    "*.granbluefantasy.akamaized.net",
-]
+SAN_DOMAINS = sorted(MITM_HOSTS)
 
 # Serial numbers / signatures of the previously embedded public CA to trigger automatic replacement
 OLD_LEAKED_SERIALS = {
@@ -105,6 +89,13 @@ def ensure_ca():
         try:
             cert_data = CA_CERT_PATH.read_bytes()
             existing_cert = x509.load_pem_x509_certificate(cert_data)
+            existing_key = serialization.load_pem_private_key(CA_KEY_PATH.read_bytes(), password=None)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            if (existing_cert.public_key().public_numbers() != existing_key.public_key().public_numbers()
+                    or not existing_cert.not_valid_before_utc <= now < existing_cert.not_valid_after_utc
+                    or not existing_cert.extensions.get_extension_for_class(x509.BasicConstraints).value.ca):
+                need_generate = True
+            existing_cert.verify_directly_issued_by(existing_cert)
             # Detect old hardcoded CA and regenerate unique one
             common_names = existing_cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
             cn_val = common_names[0].value if common_names else ""
@@ -132,12 +123,18 @@ def ensure_server_cert():
         try:
             srv_data = SERVER_CERT_PATH.read_bytes()
             srv_cert = x509.load_pem_x509_certificate(srv_data)
+            srv_key = serialization.load_pem_private_key(SERVER_KEY_PATH.read_bytes(), password=None)
+            srv_cert.verify_directly_issued_by(ca_cert)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            if (srv_cert.public_key().public_numbers() != srv_key.public_key().public_numbers()
+                    or not srv_cert.not_valid_before_utc <= now < srv_cert.not_valid_after_utc):
+                need_generate = True
             if srv_cert.issuer != ca_cert.subject:
                 need_generate = True
             else:
                 ext = srv_cert.extensions.get_extension_for_oid(x509.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
                 current_sans = set(ext.value.get_values_for_type(x509.DNSName))
-                if not set(SAN_DOMAINS).issubset(current_sans):
+                if set(SAN_DOMAINS) != current_sans:
                     need_generate = True
         except Exception:
             need_generate = True
@@ -161,9 +158,10 @@ def ensure_server_cert():
         .public_key(server_key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - datetime.timedelta(days=1))
-        .not_valid_after(now + datetime.timedelta(days=3650))
+        .not_valid_after(min(now + datetime.timedelta(days=365), ca_cert.not_valid_after_utc))
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .add_extension(x509.SubjectAlternativeName(sans), critical=False)
+        .add_extension(x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
         .sign(ca_key, hashes.SHA256())
     )
 

@@ -18,6 +18,10 @@ config.json
 *.log
 stdout.log
 stderr.log
+cache/
+download_cache/
+probe-cache-*/
+probe_result.json
 
 # IDE & OS files
 .idea/

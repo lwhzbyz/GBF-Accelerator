@@ -1,284 +1,204 @@
+"""Configuration and explicit Windows certificate integration."""
 import json
 import os
-import re
 import socket
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
 
-def get_base_dir() -> Path:
-    """Return directory where executable or main script is located."""
-    if getattr(sys, "frozen", False):
-        # Running as PyInstaller bundled executable
-        return Path(sys.executable).parent.resolve()
-    return Path(__file__).parent.resolve()
 
-CONFIG_FILE = get_base_dir() / "config.json"
+def get_base_dir():
+    return Path(sys.executable if getattr(sys, "frozen", False) else __file__).parent.resolve()
 
-DEFAULT_CONFIG: Dict[str, Any] = {
-    "listen_host": "127.0.0.1",
-    "listen_port": 8124,
-    "upstream_proxy": "auto",  # auto-probe 7897, 7890, 10808, 10809
-    "cache_dir": "auto",       # auto-detect ACGPower or use ./cache/gbf/https
-    "clean_zombies": True,
-    "auto_system_proxy": True, # Automatically mount PAC in Windows Internet Settings
-    "enable_ram_cache": True,  # In-memory LRU hot cache (fast RAM lookup)
-    "ram_cache_max_mb": 256,   # Max RAM allocation for hot cache (in MB)
-    "enable_browser_cache": False, # Conservative default: only inject immutable on versioned assets if enabled
-    "enable_auto_repair": True, # Auto-detect and clean 0-byte or corrupted cache files
-    "verify_upstream_tls": True, # Upstream TLS certificate verification for security
+
+def get_data_dir():
+    return Path(os.environ.get("GBF_ACCELERATOR_DATA_DIR", get_base_dir())).resolve()
+
+
+CONFIG_FILE = get_data_dir() / "config.json"
+DEFAULT_CONFIG = {
+    "listen_host": "127.0.0.1", "listen_port": 8124,
+    "upstream_proxy": "direct", "cache_dir": "auto", "legacy_cache_dir": "",
+    "auto_system_proxy": False, "enable_ram_cache": True, "ram_cache_max_mb": 256,
+    "enable_browser_cache": False, "enable_auto_repair": True,
+    "verify_upstream_tls": True, "max_response_mb": 64,
 }
+KNOWN_ACGPOWER_PATHS = [Path(f"{drive}:/{'acgpower/cache/gbf/https'}") for drive in "CDEF"]
+PROBE_PROXY_PORTS = [(7897, "Clash Mixed"), (7890, "HTTP"), (10808, "Mixed"), (10809, "HTTP")]
+LEGACY_CA_SHA1 = "51E9AA40A64FB8DC63F18F4B1A11B98D1CF8D3FF"
 
-KNOWN_ACGPOWER_PATHS = [
-    Path(r"D:\acgpower\cache\gbf\https"),
-    Path(r"C:\acgpower\cache\gbf\https"),
-    Path(r"E:\acgpower\cache\gbf\https"),
-    Path(r"F:\acgpower\cache\gbf\https"),
-]
 
-PROBE_PROXY_PORTS = [
-    (7897, "Clash Verge (Mixed Port)"),
-    (7890, "Clash Default (HTTP)"),
-    (10808, "v2rayN (HTTP)"),
-    (10809, "v2rayN (SOCKS/HTTP)"),
-]
-
-def is_port_open(host: str, port: int, timeout: float = 0.3) -> bool:
+def is_port_open(host, port, timeout=0.3):
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
-    except (socket.timeout, ConnectionRefusedError, OSError):
+    except OSError:
         return False
 
-def auto_detect_upstream_proxy() -> str:
-    """Probe common local proxy ports and return active proxy URL."""
-    for port, name in PROBE_PROXY_PORTS:
-        if is_port_open("127.0.0.1", port):
-            return f"http://127.0.0.1:{port}"
-    return "http://127.0.0.1:7897"  # Default fallback
 
-def auto_detect_acgpower_cache() -> Optional[Path]:
-    """Check common paths and relative paths for existing ACGPower cache."""
-    # Check parent paths in case the exe is placed in or near acgpower
-    base_dir = get_base_dir()
-    for p in [base_dir / "cache" / "gbf" / "https", base_dir.parent / "cache" / "gbf" / "https", base_dir.parent.parent / "cache" / "gbf" / "https"]:
-        if p.is_dir() and (p / "assets").is_dir():
-            return p
+def normalize_upstream(value):
+    value = str(value or "direct").strip()
+    if value.lower() == "direct":
+        return "direct"
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme not in ("http", "https", "socks5", "socks5h") or not parsed.hostname:
+        raise ValueError("上游必须是 direct 或 http(s)://、socks5(h):// 代理地址")
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise ValueError("上游代理地址不能包含路径、查询或片段")
+    if parsed.port is not None and not 1 <= parsed.port <= 65535:
+        raise ValueError("上游端口无效")
+    return value
 
-    for p in KNOWN_ACGPOWER_PATHS:
-        if p.is_dir() and (p / "assets").is_dir():
-            return p
+
+def auto_detect_upstream_proxy():
+    # A listening port alone does not prove HTTP proxy support.
+    for port, _ in PROBE_PROXY_PORTS:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.3) as conn:
+                conn.settimeout(0.5)
+                conn.sendall(b"OPTIONS * HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                if conn.recv(32).startswith(b"HTTP/1."):
+                    return f"http://127.0.0.1:{port}"
+        except OSError:
+            pass
+    return "direct"
+
+
+def auto_detect_acgpower_cache():
+    base = get_base_dir()
+    for path in [p / "cache/gbf/https" for p in (base, base.parent, base.parent.parent)] + KNOWN_ACGPOWER_PATHS:
+        if (path / "assets").is_dir():
+            return path
     return None
 
-def is_ca_installed() -> bool:
-    """Check if GBF Root CA is installed in CurrentUser Root store."""
-    for name in ["GBF Local Accelerator Root CA", "GBF Speed CA", "GBF Local CA"]:
-        try:
-            res = subprocess.run(
-                ["certutil", "-user", "-verifystore", "Root", name],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=3,
-            )
-            if res.returncode == 0:
-                return True
-        except Exception:
-            pass
-    return False
 
-def install_ca_certificate(ca_path: Path) -> bool:
-    """Install Root CA into CurrentUser Root store."""
-    if not ca_path.is_file():
-        return False
+def check_upstream_connectivity(upstream_url):
     try:
-        res = subprocess.run(
-            ["certutil", "-addstore", "-user", "Root", str(ca_path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=10,
-        )
-        return res.returncode == 0
-    except Exception:
-        return False
+        value = normalize_upstream(upstream_url)
+        if value == "direct":
+            return True, "直连系统网络（可由 UU 等加速器接管，是否覆盖需实测）"
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port or {"http": 80, "https": 443, "socks5": 1080, "socks5h": 1080}[parsed.scheme]
+        with socket.create_connection((parsed.hostname, port), timeout=1.5):
+            return True, "上游 TCP 端口可达；协议与认证将在连接时验证"
+    except (OSError, ValueError) as exc:
+        return False, f"上游连接检查失败：{exc}"
 
-def uninstall_ca_certificate() -> Tuple[bool, str]:
-    """Uninstall and remove GBF Root CA from CurrentUser Root store."""
-    if sys.platform != "win32":
-        return False, "非 Windows 系统无需卸载"
-    success = False
-    messages = []
-    for name in ["GBF Local Accelerator Root CA", "GBF Speed CA", "GBF Local CA"]:
-        try:
-            res = subprocess.run(
-                ["certutil", "-delstore", "-user", "Root", name],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=10,
-            )
-            if res.returncode == 0:
-                success = True
-                messages.append(f"已清理证书: {name}")
-        except Exception:
-            pass
-    if success:
-        return True, "\n".join(messages)
-    return False, "未在系统中找到 GBF 根证书"
 
-def check_upstream_connectivity(upstream_url: str) -> Tuple[bool, str]:
-    """Test TCP connectivity to the upstream proxy server."""
-    if not upstream_url or upstream_url == "direct":
-        return True, "直连模式"
-    try:
-        parsed = urllib.parse.urlparse(upstream_url)
-        host = parsed.hostname or "127.0.0.1"
-        port = parsed.port or (7890 if "7890" in upstream_url else 7897)
-        with socket.create_connection((host, port), timeout=1.5):
-            return True, f"成功连通上游代理 {host}:{port}"
-    except (socket.timeout, ConnectionRefusedError):
-        return False, f"上游代理无法连通（连接被拒绝或超时，请检查 Clash 是否已启动）"
-    except Exception as e:
-        return False, f"上游代理连接异常: {e}"
-
-def kill_process_on_port(port: int) -> bool:
-    """Safely terminate previous GBF_Accelerator instances listening on port.
-    Guarantees exact port boundary matching and strictly inspects process identity.
-    """
+def _certutil(arguments):
     if sys.platform != "win32":
         return False
-    if port in (7890, 7897, 10808, 10809, 80, 443):
-        return False
     try:
-        output = subprocess.check_output("netstat -aon", shell=True, text=True, timeout=3)
-        # Match exact local address and port boundary: e.g. "  TCP    127.0.0.1:8124    0.0.0.0:0   LISTENING   12345"
-        port_pattern = re.compile(rf":{port}\s+.*LISTENING\s+(\d+)", re.IGNORECASE)
-        pids = set()
-        for line in output.splitlines():
-            m = port_pattern.search(line)
-            if m:
-                pids.add(m.group(1))
+        result = subprocess.run(["certutil", *arguments], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
-        current_pid = str(os.getpid())
-        for pid in pids:
-            if not pid.isdigit() or pid in ("0", "4", current_pid):
-                continue
-            proc_info = subprocess.check_output(f'tasklist /FI "PID eq {pid}" /FO CSV /NH', shell=True, text=True, timeout=3).strip()
-            
-            should_kill = False
-            if "GBF_Accelerator" in proc_info:
-                should_kill = True
-            elif "python" in proc_info.lower():
-                # Inspect command line to be 100% sure it's this proxy and not an unrelated Python development project
-                try:
-                    cmd_out = subprocess.check_output(
-                        f'wmic process where "ProcessId={pid}" get CommandLine /format:list',
-                        shell=True,
-                        text=True,
-                        stderr=subprocess.DEVNULL,
-                        timeout=3,
-                    )
-                    if any(target in cmd_out for target in ("gbf_proxy", "app_main", "GBFAccelerator")):
-                        should_kill = True
-                except Exception:
-                    pass
 
-            if should_kill:
-                subprocess.run(f"taskkill /F /PID {pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
-            else:
-                return False
+def _ca_thumbprint(path=None):
+    from cert_manager import CA_CERT_PATH
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    try:
+        cert = x509.load_pem_x509_certificate(Path(path or CA_CERT_PATH).read_bytes())
+        return cert.fingerprint(hashes.SHA1()).hex().upper()
+    except (OSError, ValueError):
+        return None
+
+
+def is_ca_installed():
+    thumbprint = _ca_thumbprint()
+    return bool(thumbprint and thumbprint != LEGACY_CA_SHA1 and _certutil(["-user", "-verifystore", "Root", thumbprint]))
+
+
+def is_legacy_ca_installed():
+    return _certutil(["-user", "-verifystore", "Root", LEGACY_CA_SHA1])
+
+
+def remove_legacy_ca_certificate():
+    if not is_legacy_ca_installed():
         return True
-    except Exception:
+    return (_certutil(["-delstore", "-user", "Root", LEGACY_CA_SHA1])
+            and not is_legacy_ca_installed())
+
+
+def install_ca_certificate(ca_path, remove_legacy=False):
+    thumbprint = _ca_thumbprint(ca_path)
+    if not thumbprint or thumbprint == LEGACY_CA_SHA1:
         return False
+    if is_legacy_ca_installed():
+        if not remove_legacy or not remove_legacy_ca_certificate():
+            return False
+    return (_certutil(["-addstore", "-user", "Root", str(ca_path)])
+            and _certutil(["-user", "-verifystore", "Root", thumbprint]))
+
+
+def uninstall_ca_certificate():
+    thumbprint = _ca_thumbprint()
+    if not thumbprint:
+        return False, "没有可识别的本机 CA 文件；不会按名称删除证书"
+    success = (_certutil(["-delstore", "-user", "Root", thumbprint])
+               and not _certutil(["-user", "-verifystore", "Root", thumbprint]))
+    return success, "已移除当前 CA 的精确信任" if success else "移除失败或该 CA 未安装"
+
 
 class ConfigManager:
-    def __init__(self):
-        self.config_path = CONFIG_FILE
-        self.config = self.load_config()
-
-    def load_config(self) -> Dict[str, Any]:
-        cfg = dict(DEFAULT_CONFIG)
+    def __init__(self, config_path=None):
+        self.config_path = Path(config_path or CONFIG_FILE)
+        self.config = dict(DEFAULT_CONFIG)
         if self.config_path.is_file():
-            try:
-                with open(self.config_path, "r", encoding="utf-8") as f:
-                    user_cfg = json.load(f)
-                    cfg.update(user_cfg)
-            except Exception:
-                pass
-        return cfg
+            with self.config_path.open(encoding="utf-8-sig") as handle:
+                loaded = json.load(handle)
+            if not isinstance(loaded, dict):
+                raise ValueError("config.json 必须是 JSON 对象")
+            self.config.update(loaded)
 
     def save_config(self):
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
         try:
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(self.config, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.config_path.parent, delete=False) as handle:
+                temporary = Path(handle.name)
+                json.dump(self.config, handle, indent=2, ensure_ascii=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.config_path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
-    def get_listen_port(self) -> int:
-        val = self.config.get("listen_port") or self.config.get("local_port", 8124)
-        try:
-            port = int(val)
-            if 1 <= port <= 65535:
-                return port
-        except Exception:
-            pass
-        return 8124
+    def get_listen_port(self):
+        port = int(self.config.get("listen_port", 8124))
+        if not 1 <= port <= 65535:
+            raise ValueError("监听端口必须为 1 到 65535")
+        return port
 
-    def get_effective_cache_dir(self, interactive: bool = True) -> Path:
-        raw_val = self.config.get("cache_dir", "auto")
-        if raw_val != "auto" and raw_val:
-            p = Path(raw_val)
-            if not p.is_absolute():
-                p = (get_base_dir() / p).resolve()
-            p.mkdir(parents=True, exist_ok=True)
-            return p
+    def get_effective_cache_dir(self, interactive=False):
+        raw = self.config.get("cache_dir", "auto")
+        default = get_data_dir() / "cache"
+        path = default if not raw or raw == "auto" else Path(raw)
+        if not path.is_absolute():
+            path = get_data_dir() / path
+        # Prior releases stored an ACGP directory in cache_dir. Import it read-only.
+        if (path / "assets").is_dir():
+            if not self.config.get("legacy_cache_dir"):
+                self.config["legacy_cache_dir"] = str(path.resolve())
+            path = get_data_dir() / "download_cache"
+        return path.resolve()
 
-        # Check if ACGPower cache is detected
-        acgp_path = auto_detect_acgpower_cache()
-        default_local = (get_base_dir() / "cache" / "gbf" / "https").resolve()
+    def get_effective_legacy_cache_dir(self):
+        raw = self.config.get("legacy_cache_dir")
+        if not raw:
+            return None
+        path = Path(raw)
+        return (path if path.is_absolute() else get_data_dir() / path).resolve()
 
-        if acgp_path and interactive and sys.stdin.isatty():
-            print("\n" + "=" * 65)
-            print("   [+] 智能缓存检测：发现电脑中已存在的 ACGPower 缓存！")
-            print(f"       检测到路径: {acgp_path}")
-            print("   --------------------------------------------------------------")
-            print("   [1] 直接复用 ACGPower 缓存 (推荐！无需重新下载，立享本地极速响应)")
-            print(f"   [2] 在程序同级目录新建独立缓存 ({default_local})")
-            print("   [3] 手动输入自定义缓存路径")
-            print("=" * 65)
-            try:
-                choice = input("   请选择 [直接回车默认 1]: ").strip()
-            except Exception:
-                choice = "1"
+    def get_effective_upstream_proxy(self):
+        raw = self.config.get("upstream_proxy", "direct")
+        return auto_detect_upstream_proxy() if raw == "auto" else normalize_upstream(raw)
 
-            if choice == "2":
-                chosen = default_local
-            elif choice == "3":
-                custom = input("   请输入自定义缓存文件夹路径: ").strip()
-                chosen = Path(custom).resolve() if custom else default_local
-            else:
-                chosen = acgp_path
-
-            self.config["cache_dir"] = str(chosen)
-            self.save_config()
-            chosen.mkdir(parents=True, exist_ok=True)
-            return chosen
-
-        # If not interactive or no prompt, use acgp_path if found, else default
-        chosen = acgp_path if acgp_path else default_local
-        self.config["cache_dir"] = str(chosen)
-        self.save_config()
-        chosen.mkdir(parents=True, exist_ok=True)
-        return chosen
-
-    def get_effective_upstream_proxy(self) -> str:
-        raw_val = self.config.get("upstream_proxy", "auto")
-        if raw_val != "auto" and raw_val:
-            return raw_val
-        detected = auto_detect_upstream_proxy()
-        return detected
 
 config_manager = ConfigManager()

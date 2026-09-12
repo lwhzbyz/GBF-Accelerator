@@ -1,10 +1,7 @@
 import os
 import sys
-import time
 import threading
-import subprocess
 import urllib.parse
-import webbrowser
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
@@ -33,8 +30,9 @@ from config_manager import (
     uninstall_ca_certificate,
     auto_detect_acgpower_cache,
     auto_detect_upstream_proxy,
-    is_port_open,
     check_upstream_connectivity,
+    normalize_upstream,
+    is_legacy_ca_installed,
 )
 from cert_manager import ensure_ca, CA_CERT_PATH, get_ca_fingerprint_sha256
 from cache_manager import cache_manager
@@ -63,9 +61,9 @@ def create_tray_icon_image(is_running: bool = True) -> Image.Image:
 class GBFAcceleratorGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("GBF 加速器")
-        self.root.geometry("640x740")
-        self.root.minsize(600, 700)
+        self.root.title("GBF 加速器 · 缓存隔离修复版")
+        self.root.geometry("760x820")
+        self.root.minsize(720, 600)
 
         # Center window
         self.center_window()
@@ -74,16 +72,17 @@ class GBFAcceleratorGUI:
         self.setup_styles()
 
         # Data variables
-        self.var_status_text = tk.StringVar(value="● 正在启动中...")
+        self.var_status_text = tk.StringVar(value="● 尚未启动")
         self.var_hits = tk.StringVar(value="0")
         self.var_downloads = tk.StringVar(value="0")
         self.var_apis = tk.StringVar(value="0")
         self.var_cache_dir = tk.StringVar(value=str(config_manager.get_effective_cache_dir(interactive=False)))
+        self.var_legacy_dir = tk.StringVar(value=str(config_manager.get_effective_legacy_cache_dir() or ""))
         self.var_upstream = tk.StringVar(value=config_manager.get_effective_upstream_proxy())
         self.var_listen_port = tk.StringVar(value=str(config_manager.get_listen_port()))
         self.var_ca_status = tk.StringVar(value="检测中...")
         self.var_ca_fp = tk.StringVar(value="")
-        self.var_auto_pac = tk.BooleanVar(value=config_manager.config.get("auto_system_proxy", True))
+        self.var_auto_pac = tk.BooleanVar(value=config_manager.config.get("auto_system_proxy", False))
 
         # Performance & Resource Controls
         self.var_ram_cache = tk.BooleanVar(value=config_manager.config.get("enable_ram_cache", True))
@@ -102,15 +101,13 @@ class GBFAcceleratorGUI:
 
         # Check CA status
         self.update_ca_status()
-        if not is_ca_installed():
-            self.root.after(500, self.prompt_first_run_ca)
 
         # Ensure helper files
         from app_main import ensure_bundled_files
         ensure_bundled_files()
 
-        # Start proxy thread automatically
-        self.start_proxy()
+        # Startup and system integration remain explicit user actions.
+        self.btn_toggle.configure(text="启动加速", bg="#28a745", activebackground="#218838")
 
         # Periodic timer for stats update
         self.update_stats_loop()
@@ -236,13 +233,22 @@ class GBFAcceleratorGUI:
         btn_tray.pack(side="right")
 
         # ---------------- 4. Settings Card ----------------
-        card_settings = ttk.Frame(main_container, style="Card.TFrame", padding="14 10 14 10")
-        card_settings.pack(fill="both", expand=True)
+        settings_outer = ttk.Frame(main_container, style="Card.TFrame")
+        settings_outer.pack(fill="both", expand=True)
+        canvas = tk.Canvas(settings_outer, bg="#ffffff", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(settings_outer, orient="vertical", command=canvas.yview)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        card_settings = ttk.Frame(canvas, style="Card.TFrame", padding="14 10 14 10")
+        inner = canvas.create_window((0, 0), window=card_settings, anchor="nw")
+        card_settings.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(inner, width=event.width))
 
         ttk.Label(card_settings, text="配置选项", style="Title.TLabel").pack(anchor="w", pady=(0, 6))
 
         # Field 1: Local Cache Dir
-        ttk.Label(card_settings, text="本地缓存目录（支持无缝复用 ACGPower 缓存）：", style="Normal.TLabel").pack(anchor="w")
+        ttk.Label(card_settings, text="新下载缓存目录（清空操作只删除本程序的新缓存）：", style="Normal.TLabel").pack(anchor="w")
         f_dir = ttk.Frame(card_settings, style="CardInner.TFrame")
         f_dir.pack(fill="x", pady=(2, 6))
 
@@ -255,8 +261,14 @@ class GBFAcceleratorGUI:
         btn_acgp = ttk.Button(f_dir, text="检测 ACGP", width=11, command=self.detect_acgp)
         btn_acgp.pack(side="left")
 
+        ttk.Label(card_settings, text="ACGP 旧缓存来源（只读，可留空；首次使用由源站验证）：", style="Normal.TLabel").pack(anchor="w")
+        f_legacy = ttk.Frame(card_settings, style="CardInner.TFrame")
+        f_legacy.pack(fill="x", pady=(2, 6))
+        ttk.Entry(f_legacy, textvariable=self.var_legacy_dir, font=("Consolas", 9)).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ttk.Button(f_legacy, text="选择来源", command=self.browse_legacy_dir).pack(side="left")
+
         # Field 2: Upstream Proxy
-        ttk.Label(card_settings, text="上游网络代理（Clash Verge / Clash / v2rayN）：", style="Normal.TLabel").pack(anchor="w")
+        ttk.Label(card_settings, text="上游：direct 使用系统网络（UU 是否接管取决于加速范围）：", style="Normal.TLabel").pack(anchor="w")
         f_up = ttk.Frame(card_settings, style="CardInner.TFrame")
         f_up.pack(fill="x", pady=(2, 6))
 
@@ -265,6 +277,7 @@ class GBFAcceleratorGUI:
 
         btn_probe = ttk.Button(f_up, text="自动探测", width=10, command=self.probe_upstream)
         btn_probe.pack(side="left")
+        ttk.Button(f_up, text="直连 / UU", command=lambda: self.var_upstream.set("direct")).pack(side="left", padx=(4, 0))
 
         # Field 3: Local Listen Port
         ttk.Label(card_settings, text="本地监听端口（默认 8124，支持自定义）：", style="Normal.TLabel").pack(anchor="w")
@@ -298,7 +311,7 @@ class GBFAcceleratorGUI:
         f_ca_fp = ttk.Frame(card_settings, style="CardInner.TFrame")
         f_ca_fp.pack(fill="x", pady=(1, 4))
         ttk.Label(f_ca_fp, text="SHA-256 指纹：", style="Gray.TLabel").pack(side="left")
-        self.lbl_ca_fp = ttk.Label(f_ca_fp, textvariable=self.var_ca_fp, style="Gray.TLabel", font=("Consolas", 8))
+        self.lbl_ca_fp = ttk.Label(f_ca_fp, textvariable=self.var_ca_fp, style="Gray.TLabel", font=("Consolas", 8), wraplength=540)
         self.lbl_ca_fp.pack(side="left")
 
         # Field 5: Windows System PAC Automation
@@ -306,7 +319,7 @@ class GBFAcceleratorGUI:
         f_sys_proxy.pack(fill="x", pady=(4, 2))
         chk_pac = ttk.Checkbutton(
             f_sys_proxy,
-            text="自动配置 Windows 系统 PAC 代理（开启后浏览器无需插件，仅分流 GBF 流量）",
+            text="启动时设置系统 PAC（可选；也可在浏览器中单独配置本地代理）",
             variable=self.var_auto_pac,
             command=self.toggle_sys_proxy_setting,
         )
@@ -316,7 +329,7 @@ class GBFAcceleratorGUI:
         ttk.Separator(card_settings, orient="horizontal").pack(fill="x", pady=(6, 6))
         ttk.Label(
             card_settings,
-            text="性能与系统资源选项（默认开启；若需降低内存/显存占用可取消对应勾选）：",
+            text="缓存选项：",
             style="Normal.TLabel",
         ).pack(anchor="w", pady=(0, 3))
 
@@ -325,7 +338,7 @@ class GBFAcceleratorGUI:
 
         chk_ram = ttk.Checkbutton(
             f_perf,
-            text="启用内存热点缓存 (RAM Cache) - 占用约 256MB 内存，高频静态资源 0 磁盘 I/O 极速直出",
+            text="启用内存热点缓存（正文容量上限默认 256 MB，按实际使用分配）",
             variable=self.var_ram_cache,
             command=self.toggle_perf_settings,
         )
@@ -333,7 +346,7 @@ class GBFAcceleratorGUI:
 
         chk_browser = ttk.Checkbutton(
             f_perf,
-            text="启用浏览器强缓存与渲染留存（仅对版本化静态资源注入 immutable，默认关闭）",
+            text="对有明确新鲜期的版本化资源增加 immutable（默认关闭）",
             variable=self.var_browser_cache,
             command=self.toggle_perf_settings,
         )
@@ -341,7 +354,7 @@ class GBFAcceleratorGUI:
 
         chk_repair = ttk.Checkbutton(
             f_perf,
-            text="自动检测并修复损坏/空缓存 - 自动识别并重下 0 字节损坏文件，防止黑屏卡死",
+            text="自动删除损坏的新缓存条目（完整性始终校验；旧缓存只读）",
             variable=self.var_auto_repair,
             command=self.toggle_perf_settings,
         )
@@ -355,7 +368,10 @@ class GBFAcceleratorGUI:
         else:
             self.var_ca_fp.set("未生成")
 
-        if is_ca_installed():
+        if is_legacy_ca_installed():
+            self.var_ca_status.set("旧 CA 需迁移")
+            self.lbl_ca.configure(foreground="#dc3545")
+        elif is_ca_installed():
             self.var_ca_status.set("已信任 (正常工作)")
             self.lbl_ca.configure(foreground="#28a745")
         else:
@@ -364,12 +380,19 @@ class GBFAcceleratorGUI:
 
     def install_ca(self):
         ensure_ca()
-        if is_ca_installed():
+        self.update_ca_status()
+        legacy = is_legacy_ca_installed()
+        if is_ca_installed() and not legacy:
             messagebox.showinfo("根证书提示", "根证书已在系统的【受信任的根证书颁发机构】中，无需重复安装！")
             return
 
-        messagebox.showinfo("安装指引", "即将调起 Windows 证书导入向导，若弹出系统安全提示框，请点击【是 (Y)】允许信任。")
-        install_ca_certificate(CA_CERT_PATH)
+        detail = "将安装界面显示指纹的本机 CA 到当前用户的受信任根证书存储。"
+        if legacy:
+            detail += "\n\n同时移除已知公开私钥对应的旧 CA，仅匹配指纹：\n51E9AA40A64FB8DC63F18F4B1A11B98D1CF8D3FF"
+        if not messagebox.askyesno("确认 CA 安装 / 迁移", detail):
+            return
+        if not install_ca_certificate(CA_CERT_PATH, remove_legacy=legacy):
+            messagebox.showerror("CA 安装未完成", "证书安装或旧信任清理未完成，请检查系统提示。")
         self.update_ca_status()
 
     def uninstall_ca(self):
@@ -385,23 +408,12 @@ class GBFAcceleratorGUI:
             messagebox.showwarning("注销提示", f"注销结果：\n{msg}")
         self.update_ca_status()
 
-    def prompt_first_run_ca(self):
-        if not is_ca_installed():
-            if messagebox.askyesno(
-                "根证书安装引导",
-                "检测到本机尚未安装/信任加速器专属的 HTTPS 根证书。\n\n"
-                "碧蓝幻想的大部分静态资源（立绘、音频、脚本等）均通过 HTTPS 传输。"
-                "安装根证书后，加速器才能解密并为您极速缓存这些静态素材。\n\n"
-                "是否立即启动一键安装向导？\n"
-                "（若弹出系统安全提示框，请点击【是 (Y)】允许信任）",
-            ):
-                self.install_ca()
-
     def clear_cache_dialog(self):
         if not messagebox.askyesno(
             "清空本地缓存确认",
             "确定要清空全部本地缓存吗？\n\n"
-            "• 将删除磁盘缓存目录中的所有已下载静态资源文件\n"
+            "• 将仅删除新缓存 entries-v2 内本程序生成的条目\n"
+            "• ACGP 旧缓存与目录中的其他文件保持不变\n"
             "• 将清空当前内存热点缓存\n\n"
             "下次游玩时将重新按需下载最新素材。",
         ):
@@ -414,39 +426,29 @@ class GBFAcceleratorGUI:
         chosen = filedialog.askdirectory(title="选择 GBF 本地缓存保存目录", initialdir=self.var_cache_dir.get())
         if chosen:
             p = Path(chosen).resolve()
+            if (p / "assets").is_dir():
+                self.var_legacy_dir.set(str(p))
+                messagebox.showinfo("旧缓存来源", "已填写为只读来源。新下载仍使用独立目录；点击保存配置生效。")
+                return
             self.var_cache_dir.set(str(p))
-            cache_manager.set_cache_base(p)
-            config_manager.config["cache_dir"] = str(p)
-            config_manager.save_config()
-            messagebox.showinfo("缓存设置", f"缓存目录已成功更改为：\n{p}")
+
+    def browse_legacy_dir(self):
+        chosen = filedialog.askdirectory(title="选择只读 ACGP https 缓存目录")
+        if chosen:
+            self.var_legacy_dir.set(str(Path(chosen).resolve()))
 
     def detect_acgp(self):
         found = auto_detect_acgpower_cache()
         if found:
-            self.var_cache_dir.set(str(found))
-            cache_manager.set_cache_base(found)
-            config_manager.config["cache_dir"] = str(found)
-            config_manager.save_config()
-            messagebox.showinfo("ACGP 探测成功", f"成功检测到 ACGPower 缓存目录！\n\n路径：{found}\n\n已自动关联，无需重新下载游戏静态资源！")
+            self.var_legacy_dir.set(str(found))
+            messagebox.showinfo("ACGP 探测成功", f"发现只读来源：\n{found}\n\n点击保存配置后生效，新下载使用独立目录。")
         else:
             messagebox.showwarning("探测结果", "在常用盘符（C/D/E/F 盘）中未找到现成的 ACGPower 缓存。\n你可以点击【浏览...】手动指定。")
 
     def probe_upstream(self):
         active = auto_detect_upstream_proxy()
         self.var_upstream.set(active)
-        config_manager.config["upstream_proxy"] = active
-        config_manager.save_config()
-        gbf_proxy.UPSTREAM_PROXY = active
-        # Check connectivity
-        ok, msg = check_upstream_connectivity(active)
-        # Restart proxy if running so connection pool picks up the new upstream proxy
-        if gbf_proxy.PROXY_STATS.get("is_running", False):
-            self.stop_proxy()
-            self.start_proxy()
-        if ok:
-            messagebox.showinfo("上游探测结果", f"检测并连通本地代理服务：\n{active}\n\n代理连接池已更新生效！")
-        else:
-            messagebox.showwarning("上游探测警告", f"检测到本地代理地址：\n{active}\n\n但连通测试失败：{msg}\n请确认 Clash 是否已启动并开启本地监听。")
+        messagebox.showinfo("上游探测结果", f"已填写：{active}\n点击保存配置或启动加速后生效。\nHTTP 响应探测不能代替实际上游认证和联网验证。")
 
     def reset_port_default(self):
         self.var_listen_port.set("8124")
@@ -454,10 +456,18 @@ class GBFAcceleratorGUI:
     def save_settings(self):
         up = self.var_upstream.get().strip()
         cd = self.var_cache_dir.get().strip()
+        legacy = self.var_legacy_dir.get().strip()
         port_str = self.var_listen_port.get().strip()
 
         if not up:
             messagebox.showerror("错误", "上游代理地址不能为空！")
+            return
+        try:
+            up = normalize_upstream(up)
+            if not cd:
+                raise ValueError("请指定新缓存目录")
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("配置无效", str(exc))
             return
 
         try:
@@ -488,8 +498,15 @@ class GBFAcceleratorGUI:
             if not messagebox.askyesno("上游代理连通警告", f"测试连接上游代理失败：\n{up_msg}\n\n是否仍然保存该代理地址？"):
                 return
 
+        try:
+            cache_manager.configure_paths(Path(cd), Path(legacy) if legacy else None)
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("配置无效", str(exc))
+            return
+
         config_manager.config["upstream_proxy"] = up
         config_manager.config["cache_dir"] = cd
+        config_manager.config["legacy_cache_dir"] = legacy
         config_manager.config["listen_port"] = port
         config_manager.config["auto_system_proxy"] = self.var_auto_pac.get()
         config_manager.config["enable_ram_cache"] = self.var_ram_cache.get()
@@ -501,8 +518,6 @@ class GBFAcceleratorGUI:
             cache_manager.clear_ram_cache()
 
         gbf_proxy.UPSTREAM_PROXY = up
-        if cd:
-            cache_manager.set_cache_base(Path(cd).resolve())
 
         # Update local proxy.pac file
         from app_main import update_pac_file
@@ -548,7 +563,7 @@ class GBFAcceleratorGUI:
         if readme.is_file():
             os.startfile(str(readme))
         else:
-            messagebox.showinfo("分流指引", "请使用 ZeroOmega / SwitchyOmega 导入同目录下的 SwitchyOmega_GBF.bak，或直接勾选【自动配置 Windows 系统 PAC 代理】实现免插件极速游玩。")
+            messagebox.showinfo("分流指引", "在浏览器扩展中添加 PAC 地址 http://127.0.0.1:8124/proxy.pac（端口以实际配置为准）。系统 PAC 是另一个可选入口。")
 
     def toggle_proxy(self):
         if gbf_proxy.PROXY_STATS["is_running"]:
@@ -566,7 +581,14 @@ class GBFAcceleratorGUI:
             messagebox.showerror("端口错误", "本地监听端口必须是 1 到 65535 之间的整数！")
             return
 
-        up = self.var_upstream.get().strip() or "http://127.0.0.1:7897"
+        try:
+            up = normalize_upstream(self.var_upstream.get().strip())
+            if not self.var_cache_dir.get().strip():
+                raise ValueError("请指定新缓存目录")
+            cache_manager.configure_paths(Path(self.var_cache_dir.get()), self.var_legacy_dir.get().strip() or None)
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("配置无效", str(exc))
+            return
         try:
             parsed_up = urllib.parse.urlparse(up)
             if parsed_up.port == port:
@@ -580,12 +602,13 @@ class GBFAcceleratorGUI:
         gbf_proxy.UPSTREAM_PROXY = up
         config_manager.config["listen_port"] = port
         config_manager.config["upstream_proxy"] = up
+        config_manager.config["cache_dir"] = self.var_cache_dir.get().strip()
+        config_manager.config["legacy_cache_dir"] = self.var_legacy_dir.get().strip()
+        config_manager.config["auto_system_proxy"] = self.var_auto_pac.get()
         config_manager.config["enable_ram_cache"] = self.var_ram_cache.get()
         config_manager.config["enable_browser_cache"] = self.var_browser_cache.get()
         config_manager.config["enable_auto_repair"] = self.var_auto_repair.get()
         config_manager.save_config()
-
-        cache_manager.set_cache_base(Path(self.var_cache_dir.get()).resolve())
 
         # Update local proxy.pac file
         from app_main import update_pac_file
@@ -594,7 +617,7 @@ class GBFAcceleratorGUI:
         gbf_proxy.start_proxy_thread()
 
         # Wait for actual socket bind success (up to 2 seconds)
-        is_ready = gbf_proxy.proxy_ready_event.wait(timeout=2.0)
+        is_ready = gbf_proxy.proxy_ready_event.wait(timeout=5.0)
         is_running = gbf_proxy.PROXY_STATS.get("is_running", False)
 
         if is_ready and is_running:
@@ -665,13 +688,13 @@ class GBFAcceleratorGUI:
 
     # ================= System Tray =================
     def setup_tray(self):
-        icon_img = create_tray_icon_image(True)
+        icon_img = create_tray_icon_image(False)
         menu = pystray.Menu(
-            pystray.MenuItem("显示主界面", self.show_from_tray, default=True),
+            pystray.MenuItem("显示主界面", lambda: self.root.after(0, self.show_from_tray), default=True),
             pystray.MenuItem("启动 / 暂停加速", self.toggle_proxy_from_tray),
-            pystray.MenuItem("打开缓存目录", lambda: self.open_cache_folder()),
+            pystray.MenuItem("打开缓存目录", lambda: self.root.after(0, self.open_cache_folder)),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("彻底退出", self.quit_app),
+            pystray.MenuItem("彻底退出", lambda: self.root.after(0, self.quit_app)),
         )
         self.tray_icon = pystray.Icon("GBF_Speed_Proxy", icon_img, f"GBF 加速代理 (端口 {gbf_proxy.LISTEN_PORT})", menu)
         # Run tray in separate background thread

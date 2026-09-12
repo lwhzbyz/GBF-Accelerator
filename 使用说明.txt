@@ -12,6 +12,8 @@ GBF Accelerator · 缓存隔离修复版
    GBF_Accelerator.exe --probe --upstream direct --probe-output C:\GBF_test\probe.json
    结果文件必须是新文件；查看 JSON 的 passed 和各步骤结果。
 7. 关闭窗口会隐藏到托盘；彻底退出请用托盘菜单。
+8. 登录自启动快捷方式参数：--gui --autostart --start-minimized --data-dir "C:\GBF_data"
+   自动启动代理并隐藏到托盘，启动失败时保留界面。普通双击仍需手动启动。
 
 新缓存有完整 URL 隔离、新鲜度、编码和完整性检查。
 不会改写游戏脚本、模拟动态接口、共享浏览器 Cookie 或写入旧缓存。

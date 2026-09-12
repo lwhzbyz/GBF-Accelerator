@@ -60,6 +60,8 @@ def ensure_bundled_files():
 def main(argv=None):
     parser = argparse.ArgumentParser(description="GBF local cache proxy")
     parser.add_argument("--gui", action="store_true", help="打开图形界面")
+    parser.add_argument("--autostart", action="store_true", help="打开界面并自动启动代理（供登录自启动使用）")
+    parser.add_argument("--start-minimized", action="store_true", help="界面就绪后隐藏到托盘；启动失败时保留界面")
     parser.add_argument("--data-dir", type=Path, help="独立的配置、证书和缓存目录")
     parser.add_argument("--port", type=int)
     parser.add_argument("--upstream", help="direct / http(s):// / socks5(h)://")
@@ -96,9 +98,9 @@ def main(argv=None):
             if not install_ca_certificate(CA_CERT_PATH):
                 raise SystemExit("CA 安装未完成；若仍有旧 CA，请先明确移除旧信任")
         return
-    if args.gui or (getattr(sys, "frozen", False) and len(sys.argv) == 1):
+    if args.gui or args.autostart or args.start_minimized or (getattr(sys, "frozen", False) and len(sys.argv) == 1):
         from gui_main import main as gui_main
-        gui_main()
+        gui_main(autostart=args.autostart, start_minimized=args.start_minimized)
         return
     if is_legacy_ca_installed():
         print("[!] 检测到已知旧 CA 信任。请查看 README 的迁移说明；本次不会修改证书存储。")

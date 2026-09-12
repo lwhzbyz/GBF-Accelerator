@@ -641,6 +641,29 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         await w.wait_closed()
 
 
+class StartupTests(unittest.TestCase):
+    def test_startup_options_keep_errors_visible(self):
+        import gui_main
+        for start, minimized, succeeded, expected in (
+                (False, False, False, (0, 0)), (True, True, True, (1, 1)),
+                (True, True, False, (1, 0)), (False, True, False, (0, 1)),
+                (True, False, True, (1, 0))):
+            with self.subTest(start=start, minimized=minimized, succeeded=succeeded):
+                app = types.SimpleNamespace(start_proxy=unittest.mock.Mock(), root=types.SimpleNamespace(withdraw=unittest.mock.Mock()))
+                with patch.dict(gui_main.gbf_proxy.PROXY_STATS, {"is_running": succeeded}):
+                    gui_main.apply_startup_options(app, autostart=start, start_minimized=minimized)
+                self.assertEqual((app.start_proxy.call_count, app.root.withdraw.call_count), expected)
+        self.assertEqual(VIOLATIONS, [])
+
+    def test_cli_passes_explicit_startup_options_to_gui(self):
+        import app_main
+        fake_gui = types.SimpleNamespace(main=unittest.mock.Mock())
+        with patch.dict(sys.modules, {"gui_main": fake_gui}):
+            app_main.main(["--autostart", "--start-minimized"])
+        fake_gui.main.assert_called_once_with(autostart=True, start_minimized=True)
+        self.assertEqual(VIOLATIONS, [])
+
+
 class WindowsIntegrationTests(unittest.TestCase):
     def tearDown(self): self.assertEqual(VIOLATIONS, [])
 

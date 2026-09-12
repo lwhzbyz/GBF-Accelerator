@@ -723,9 +723,18 @@ class GBFAcceleratorGUI:
             self.tray_icon.stop()
         self.root.after(0, self.root.destroy)
 
-def main():
+def apply_startup_options(app, *, autostart=False, start_minimized=False):
+    if autostart:
+        app.start_proxy()
+    if start_minimized and (not autostart or gbf_proxy.PROXY_STATS.get("is_running", False)):
+        app.root.withdraw()
+
+
+def main(*, autostart=False, start_minimized=False):
     root = tk.Tk()
     app = GBFAcceleratorGUI(root)
+    if autostart or start_minimized:
+        root.after(0, lambda: apply_startup_options(app, autostart=autostart, start_minimized=start_minimized))
     root.mainloop()
 
 if __name__ == "__main__":
